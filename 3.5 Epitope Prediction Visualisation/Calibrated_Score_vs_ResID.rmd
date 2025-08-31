@@ -1,0 +1,60 @@
+---
+title: "Calibrated score output visualisation of DiscoTope vs Residue IDs"
+output: html_notebook
+---
+
+Calibrated Score Analysis
+```{r}
+
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(cowplot)
+
+read_discotope <- function(fn, main_title = NULL, cutoff = 0.90, ylim_max = NULL) {
+  df <- readr::read_csv(fn, show_col_types = FALSE) %>%
+    dplyr::mutate(
+      Position = suppressWarnings(as.numeric(res_id)),
+      Score    = suppressWarnings(as.numeric(calibrated_score))
+    )
+
+  if (!any(is.finite(df$Position))) {
+    df <- df %>% dplyr::mutate(Position = dplyr::row_number())
+  }
+
+  y_max <- suppressWarnings(max(df$Score, na.rm = TRUE))
+  if (!is.finite(y_max)) stop("No finite calibrated scores in: ", fn)
+  y_limits <- if (is.null(ylim_max)) c(0, y_max * 1.05) else c(0, as.numeric(ylim_max))
+
+  ggplot2::ggplot(df, ggplot2::aes(x = Position, y = Score)) +
+    ggplot2::geom_point(size = 1.0, alpha = 0.25, na.rm = TRUE) +
+    ggplot2::geom_hline(yintercept = cutoff, colour = "red", linetype = "dotted", alpha = 0.8) +
+    ggplot2::coord_cartesian(ylim = y_limits) +
+    ggplot2::labs(x = "Residue ID", y = "Calibrated Epitope Score", title = main_title) +
+    ggplot2::theme_bw() +
+    ggplot2::theme(legend.position = "none",
+                   plot.title = ggplot2::element_text(hjust = 0.5, size = 12, face = "bold"))
+}
+
+
+
+#The filters using epitope=true and pLDDT filter with RSA filter
+df_pspA_csv <- "/Users/omeryurttutmus/Desktop/taxa/Filtered_Discotope_LPXTG/pspA_filtered_epitopesV4.csv"
+df_pspC_csv <- "/Users/omeryurttutmus/Desktop/taxa/Filtered_Discotope_LPXTG/pspC_filtered_epitopesV4.csv"
+df_zmpA_csv <- "/Users/omeryurttutmus/Desktop/taxa/Filtered_Discotope_LPXTG/zmpA_filtered_epitopesV4.csv"
+df_zmpB_csv <- "/Users/omeryurttutmus/Desktop/taxa/Filtered_Discotope_LPXTG/zmpB_filtered_epitopesV4.csv"
+
+p_pspA <- read_discotope(df_pspA_csv, "PspA")
+p_pspC <- read_discotope(df_pspC_csv, "PspC")
+p_zmpA <- read_discotope(df_zmpA_csv, "ZmpA")
+p_zmpB <- read_discotope(df_zmpB_csv, "ZmpB")
+
+epitope_plots <- cowplot::plot_grid(p_pspA, p_pspC, p_zmpA, p_zmpB, ncol = 2)
+final_plot <- cowplot::ggdraw() +
+  cowplot::draw_label("Calibrated Epitope Scores vs. Residue ID",
+                      fontface = "bold", x = 0.5, y = 0.99, hjust = 0.5, size = 16) +
+  cowplot::draw_plot(epitope_plots, 0, 0, 1, 0.95)
+
+ggplot2::ggsave("/Users/omeryurttutmus/Desktop/epitope_plots_calibrated_score.png",
+                final_plot, width = 10, height = 8, dpi = 300)
+```

@@ -1,0 +1,170 @@
+---
+title: "Selection of Inter/Intra clade representatives and Neighbour selection for RMSD and TM-score comparison"
+output: html_notebook
+---
+
+Selects random PDBs per each clade.
+```{r}
+
+proteins <- c("pspa", "pspc", "zmpa", "zmpb")
+colours <- c("blue", "pink", "green", "yellow", "red")
+
+base_dir <- "/Users/omeryurttutmus/Desktop/taxa/Clades"
+
+get_random_reps <- function(protein, colour, n = 5) {
+  file_path <- file.path(base_dir, protein, paste0(protein, "_", colour, ".txt"))
+  
+  if (!file.exists(file_path)) {
+    warning(paste("File not found:", file_path))
+    return(rep(NA, n))
+  }
+  
+  all_lines <- readLines(file_path)
+  if (length(all_lines) < n) {
+    warning(paste("Not enough sequences in", file_path))
+    reps <- sample(all_lines, length(all_lines))
+    reps <- c(reps, rep(NA, n - length(reps)))
+  } else {
+    reps <- sample(all_lines, n)
+  }
+  return(reps)
+}
+
+output <- data.frame()
+
+for (colour in colours) {
+  for (i in 1:5) {
+    row <- list(
+      Colour = toupper(colour),
+      Number = i
+    )
+    for (protein in proteins) {
+      reps <- get_random_reps(protein, colour)
+      row[[toupper(protein)]] <- reps[i]
+    }
+    output <- rbind(output, row)
+  }
+}
+
+write.csv(output, "random_clade_representatives.csv", row.names = FALSE)
+
+```
+
+Finds those PDB's
+```{r}
+library(dplyr)
+library(fs)
+
+
+rep_matrix_path <- "/Users/omeryurttutmus/Downloads/random_clade_representatives.csv"
+rep_matrix <- read.csv(rep_matrix_path, stringsAsFactors = FALSE)
+discotope_base <- "/Users/omeryurttutmus/Desktop/taxa/Discotope"
+output_base <- "/Users/omeryurttutmus/Desktop/rep_pdb"
+proteins <- c("PSPA", "PSPC", "ZMPA", "ZMPB")
+
+
+for (i in 1:nrow(rep_matrix)) {
+  row <- rep_matrix[i, ]
+  clade <- tolower(row$Colour)
+  
+  for (protein in proteins) {
+    protein_lower <- tolower(protein)
+    seq_id <- row[[protein]]
+    if (is.na(seq_id) || seq_id == "") next
+    if (protein %in% c("ZMPA", "ZMPB")) {
+      file_ext <- ".pdb"
+      file_name <- paste0(seq_id, "_Nterminus.fasta_I_discotope3", file_ext)
+    } else {
+      file_ext <- ".pdb"
+      file_name <- paste0(seq_id, ".fasta_I_discotope3", file_ext)
+    }
+  
+    source_path <- file.path(discotope_base, paste0(protein_lower, "_Discotope_output"), file_name)
+    
+    target_dir <- file.path(output_base, protein_lower, clade)
+    dir_create(target_dir, recurse = TRUE)
+    target_path <- file.path(target_dir, file_name)
+    
+    if (file_exists(source_path)) {
+      file_copy(source_path, target_path, overwrite = TRUE)
+    } else {
+      warning(paste("File not found:", source_path))
+    }
+  }
+}
+
+```
+Find neighbours from the randomly selected sequences
+
+```{r}
+library(readr)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+
+rep_csv <- "/Users/omeryurttutmus/Downloads/random_clade_representatives.csv"
+phylo_base <- "/Users/omeryurttutmus/Desktop/taxa/Clades"
+rep_df <- read_csv(rep_csv) %>%
+  rename(clade = Colour) %>%
+  mutate(across(everything(), tolower))
+protein_cols <- c("PSPA", "PSPC", "ZMPA", "ZMPB")
+
+#Extract neighbours
+get_neighbors <- function(protein, clade, rep_ids, phylo_lines) {
+  ids <- tolower(trimws(phylo_lines))
+  output <- list()
+  
+  for (rep in rep_ids) {
+    idx <- match(rep, ids)
+    if (is.na(idx)) {
+      warning(paste("Rep", rep, "not found in", protein, clade))
+      next
+    }
+    
+    neighbors <- ids[setdiff(intersect((idx-2):(idx+2), which(ids != rep)), idx)]
+    neighbors <- neighbors[1:min(length(neighbors), 4)] 
+    if (length(neighbors) < 4) {
+      needed <- 4 - length(neighbors)
+      extra <- setdiff(ids, c(rep, neighbors))[1:needed]
+      neighbors <- c(neighbors, extra)
+    }
+
+    output[[rep]] <- tibble(
+      protein = protein,
+      clade = clade,
+      rep_id = rep,
+      neighbor_id = neighbors
+    )
+  }
+  bind_rows(output)
+}
+
+all_matches <- list()
+
+for (protein in protein_cols) {
+  protein_dir <- file.path(phylo_base, protein)
+  reps <- rep_df %>% select(clade, rep_id = all_of(protein)) %>% distinct()
+
+  for (clade_name in unique(reps$clade)) {
+    phylo_file <- file.path(protein_dir, paste0(protein, "_", clade_name, ".txt"))
+    if (!file.exists(phylo_file)) {
+      warning(paste("Missing:", phylo_file))
+      next
+    }
+    phylo_ids <- readLines(phylo_file)
+    rep_ids <- reps %>% filter(clade == clade_name) %>% pull(rep_id)
+    
+    neighbors_df <- get_neighbors(protein, clade_name, rep_ids, phylo_ids)
+    all_matches[[paste(protein, clade_name)]] <- neighbors_df
+  }
+}
+
+final_df <- bind_rows(all_matches)
+write_csv(final_df, "/Users/omeryurttutmus/Desktop/rep_neighbor_pairs_FIXED.csv")
+summary_df <- final_df %>%
+  group_by(protein, clade) %>%
+  summarise(count = n(), .groups = "drop")
+
+print(summary_df)
+```

@@ -1,0 +1,396 @@
+---
+title: "Analysis of TM-scores and RMSD values between structures"
+output: html_notebook
+---
+
+TM-SCORE Analysis, plotted in the same figure
+
+```{r}
+
+library(tidyverse)
+library(ggplot2)
+library(cowplot)
+library(tools)
+library(purrr)
+library(stringr)
+library(readr)
+
+neighbor_file <- "/Users/omeryurttutmus/Desktop/rep_neighbor_pairs_FIXED.csv"
+align_file    <- "/Users/omeryurttutmus/Desktop/rep_neighbor_alignment_results.txt"
+
+df_map <- read_csv(neighbor_file, show_col_types = FALSE) %>%
+  mutate(clade = str_to_title(clade))
+
+align_lines    <- readLines(align_file)
+comparison_idx <- grep("^Comparing:", align_lines)
+tm_idx         <- grep("TM-score", align_lines) 
+
+
+valid_blocks <- map2_dfr(
+  comparison_idx, comparison_idx + 10,
+  ~{
+    next_tm <- tm_idx[tm_idx > .x & tm_idx < .y]
+    if (length(next_tm) == 0) return(NULL)
+    tibble(
+      comparison = align_lines[.x],
+      tm_line    = align_lines[next_tm[1]]
+    )
+  }
+)
+
+#EXtract the data from jFATCAT
+neighbor_tm_raw <- valid_blocks %>%
+  mutate(
+    rep_id      = str_match(comparison, "Comparing: ([^ ]+)\\.pdb")[,2],
+    neighbor_id = str_match(comparison, "vs\\. ([^ ]+)\\.pdb")[,2],
+    tm_score    = as.numeric(str_extract(tm_line, "0\\.\\d+|1\\.0+"))
+  ) %>%
+  filter(!is.na(rep_id), !is.na(neighbor_id), !is.na(tm_score))
+
+neighbor_df <- df_map %>%
+  left_join(neighbor_tm_raw, by = c("rep_id", "neighbor_id")) %>%
+  filter(!is.na(tm_score)) %>%
+  group_by(protein, clade) %>%
+  summarise(mean_tm = mean(tm_score), sd_tm = sd(tm_score), .groups = "drop") %>%
+  mutate(type = "Neighbor")
+
+#Protein names were not normalised so I need to normalise
+neighbor_df$protein <- case_when(
+  str_detect(neighbor_df$protein, regex("pspa", ignore_case = TRUE)) ~ "PspA",
+  str_detect(neighbor_df$protein, regex("pspc", ignore_case = TRUE)) ~ "PspC",
+  str_detect(neighbor_df$protein, regex("zmpa", ignore_case = TRUE)) ~ "ZmpA",
+  str_detect(neighbor_df$protein, regex("zmpb", ignore_case = TRUE)) ~ "ZmpB",
+  TRUE ~ neighbor_df$protein
+)
+
+protein_dirs <- list(
+  pspa = "/Users/omeryurttutmus/Desktop/rep_pdb_results/pspa",
+  pspc = "/Users/omeryurttutmus/Desktop/rep_pdb_results/pspc",
+  zmpa = "/Users/omeryurttutmus/Desktop/rep_pdb_results/zmpa",
+  zmpb = "/Users/omeryurttutmus/Desktop/rep_pdb_results/zmpb"
+)
+
+extract_tms <- function(file_path, protein) {
+  content   <- readLines(file_path)
+  tm_lines  <- grep("TM-score", content, value = TRUE)
+  tm_values <- as.numeric(str_extract(tm_lines, "(?<!\\d)(?:0?\\.\\d+|1(?:\\.0+)?)"))
+
+  file_name  <- basename(file_path)
+  split_name <- strsplit(file_name, "_vs_")[[1]]
+  clade1     <- split_name[1]
+  clade2     <- sub("\\.txt$", "", split_name[2])
+  type       <- ifelse(clade1 == clade2, "Intra", "Inter")
+
+  tibble(
+    protein, clade = clade1, compare_to = clade2,
+    tm_score = tm_values, type
+  )
+}
+
+all_tms <- map_dfr(names(protein_dirs), function(prot) {
+  files <- list.files(protein_dirs[[prot]], pattern = "_vs_.*\\.txt$", full.names = TRUE)
+  if (length(files) == 0) return(tibble())
+  map_dfr(files, extract_tms, protein = prot)
+})
+
+intra_inter_df <- all_tms %>%
+  group_by(protein, clade, type) %>%
+  summarise(
+    mean_tm = mean(tm_score, na.rm = TRUE),
+    sd_tm   = sd(tm_score,   na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    protein = case_when(
+      str_detect(protein, regex("pspa", ignore_case = TRUE)) ~ "PspA",
+      str_detect(protein, regex("pspc", ignore_case = TRUE)) ~ "PspC",
+      str_detect(protein, regex("zmpa", ignore_case = TRUE)) ~ "ZmpA",
+      str_detect(protein, regex("zmpb", ignore_case = TRUE)) ~ "ZmpB",
+      TRUE ~ protein
+    )
+  )
+
+combined_df <- bind_rows(neighbor_df, intra_inter_df) %>%
+  mutate(
+    clade = toTitleCase(clade),
+    type  = factor(type, levels = c("Neighbor", "Intra", "Inter")),
+    clade = factor(clade, levels = c("Blue", "Green", "Pink", "Red", "Yellow"))
+  )
+
+all_combinations <- expand.grid(
+  clade   = levels(combined_df$clade),
+  type    = levels(combined_df$type),
+  protein = unique(combined_df$protein)
+)
+
+combined_df_complete <- full_join(all_combinations, combined_df,
+                                  by = c("clade", "type", "protein")) %>%
+  replace_na(list(mean_tm = NA_real_, sd_tm = 0))
+
+#Plot
+comparison_colors <- c(
+  "Neighbor" = "navy",
+  "Intra"    = "royalblue",
+  "Inter"    = "skyblue3"
+)
+
+make_tm_plot <- function(df, prot, show_legend = FALSE) {
+  df_sub <- df %>% filter(protein == prot)
+
+  ggplot(df_sub, aes(x = type, y = mean_tm, fill = type)) +
+    geom_bar(stat = "identity", position = "dodge", width = 0.6, na.rm = TRUE) +
+    geom_errorbar(aes(ymin = mean_tm - sd_tm, ymax = mean_tm + sd_tm),
+                  width = 0.2, linewidth = 0.4,
+                  position = position_dodge(0.6), na.rm = TRUE) +
+    facet_wrap(~ clade, nrow = 2) +
+    scale_fill_manual(
+      values = comparison_colors,
+      labels = c("Neighbor" = "Neighbour", "Intra" = "Intra", "Inter" = "Inter")
+    ) +
+    coord_cartesian(ylim = c(0, 0.4)) + 
+    labs(
+      title = prot,
+      x     = "Comparison Type",
+      y     = "Average TM-score",
+      fill  = "Type"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title        = element_text(hjust = 0.5, size = 16, face = "bold"),
+      strip.text        = element_text(face = "bold", size = 12),
+      axis.title        = element_text(face = "bold"),
+      axis.text.x       = element_blank(),
+      axis.title.x      = element_blank(),
+      axis.text.y       = element_text(size = 10),
+      legend.title      = element_text(face = "bold"),
+      legend.text       = element_text(size = 10),
+      panel.grid.major.x= element_blank(),
+      legend.position   = if (show_legend) "right" else "none"
+    )
+}
+
+p_legend_src <- make_tm_plot(combined_df_complete, "PspA", show_legend = TRUE)
+shared_legend <- cowplot::get_legend(p_legend_src)
+
+p_pspA <- p_legend_src + theme(legend.position = "none")
+p_pspC <- make_tm_plot(combined_df_complete, "PspC", show_legend = FALSE)
+p_zmpA <- make_tm_plot(combined_df_complete, "ZmpA", show_legend = FALSE)
+p_zmpB <- make_tm_plot(combined_df_complete, "ZmpB", show_legend = FALSE)
+
+grid_2x2 <- cowplot::plot_grid(
+  p_pspA, p_pspC, p_zmpA, p_zmpB,
+  ncol = 2,
+  labels = c("A", "B", "C", "D"),
+  label_size = 14
+)
+
+with_legend_right <- cowplot::plot_grid(
+  grid_2x2, shared_legend,
+  ncol = 2, rel_widths = c(1, 0.12), align = "h"
+)
+
+final_plot <- cowplot::ggdraw() +
+  draw_label("Rep–Level TM-score Comparisons Across Proteins",
+             fontface = "bold", x = 0.5, y = 0.99, hjust = 0.5, size = 18) +
+  draw_plot(with_legend_right, 0, 0, 1, 0.95)
+
+ggsave("combined_TMScores.png",
+       plot = final_plot, width = 14, height = 12, dpi = 300, bg = "white")
+
+```
+
+
+RMSD Analysis, plotted in the same figure
+
+
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(cowplot)
+library(tools)
+library(purrr)
+library(stringr)
+library(readr)
+
+neighbor_file <- "/Users/omeryurttutmus/Desktop/rep_neighbor_pairs_FIXED.csv"
+align_file    <- "/Users/omeryurttutmus/Desktop/rep_neighbor_alignment_results.txt"
+
+df_map <- read_csv(neighbor_file, show_col_types = FALSE) %>%
+  mutate(clade = str_to_title(clade))
+
+align_lines    <- readLines(align_file)
+comparison_idx <- grep("^Comparing:", align_lines)
+rmsd_idx       <- grep("^RMSD:", align_lines)
+
+valid_blocks <- map2_dfr(
+  comparison_idx, comparison_idx + 10,
+  ~{
+    next_rmsd <- rmsd_idx[rmsd_idx > .x & rmsd_idx < .y]
+    if (length(next_rmsd) == 0) return(NULL)
+    tibble(
+      comparison = align_lines[.x],
+      rmsd_line  = align_lines[next_rmsd[1]]
+    )
+  }
+)
+
+#Extract the data from jFATCAT
+rmsd_data <- valid_blocks %>%
+  mutate(
+    rep_id      = str_match(comparison, "Comparing: ([^ ]+)\\.pdb")[,2],
+    neighbor_id = str_match(comparison, "vs\\. ([^ ]+)\\.pdb")[,2],
+    rmsd        = as.numeric(str_extract(rmsd_line, "\\d+\\.\\d+"))
+  ) %>%
+  filter(!is.na(rep_id), !is.na(neighbor_id), !is.na(rmsd))
+
+neighbor_df <- df_map %>%
+  left_join(rmsd_data, by = c("rep_id", "neighbor_id")) %>%
+  filter(!is.na(rmsd)) %>%
+  group_by(protein, clade) %>%
+  summarise(mean_rmsd = mean(rmsd), sd_rmsd = sd(rmsd), .groups = "drop") %>%
+  mutate(type = "Neighbor")
+
+#Protein names were not normalised so I need to normalise
+neighbor_df <- neighbor_df %>%
+  mutate(
+    protein = case_when(
+      str_detect(protein, regex("pspa", ignore_case = TRUE)) ~ "PspA",
+      str_detect(protein, regex("pspc", ignore_case = TRUE)) ~ "PspC",
+      str_detect(protein, regex("zmpa", ignore_case = TRUE)) ~ "ZmpA",
+      str_detect(protein, regex("zmpb", ignore_case = TRUE)) ~ "ZmpB",
+      TRUE ~ protein
+    )
+  )
+
+protein_dirs <- list(
+  pspa = "/Users/omeryurttutmus/Desktop/rep_pdb_results/pspa",
+  pspc = "/Users/omeryurttutmus/Desktop/rep_pdb_results/pspc",
+  zmpa = "/Users/omeryurttutmus/Desktop/rep_pdb_results/zmpa",
+  zmpb = "/Users/omeryurttutmus/Desktop/rep_pdb_results/zmpb"
+)
+
+extract_rmsds <- function(file_path, protein) {
+  content     <- readLines(file_path)
+  rmsd_lines  <- grep("RMSD:", content, value = TRUE)
+  rmsd_values <- as.numeric(sub(".*RMSD:\\s*", "", rmsd_lines))
+
+  file_name  <- basename(file_path)
+  parts      <- strsplit(file_name, "_vs_")[[1]]
+  clade1     <- parts[1]
+  clade2     <- sub("\\.txt$", "", parts[2])
+  type       <- ifelse(clade1 == clade2, "Intra", "Inter")
+
+  tibble(
+    protein, clade = clade1, compare_to = clade2,
+    rmsd = rmsd_values, type
+  )
+}
+
+all_rmsds <- map_dfr(names(protein_dirs), function(prot) {
+  files <- list.files(protein_dirs[[prot]], pattern = "_vs_.*\\.txt$", full.names = TRUE)
+  if (length(files) == 0) return(tibble())
+  map_dfr(files, extract_rmsds, protein = prot)
+})
+
+intra_inter_df <- all_rmsds %>%
+  group_by(protein, clade, type) %>%
+  summarise(mean_rmsd = mean(rmsd, na.rm = TRUE),
+            sd_rmsd   = sd(rmsd,   na.rm = TRUE),
+            .groups   = "drop") %>%
+  mutate(
+    protein = case_when(
+      str_detect(protein, regex("pspa", ignore_case = TRUE)) ~ "PspA",
+      str_detect(protein, regex("pspc", ignore_case = TRUE)) ~ "PspC",
+      str_detect(protein, regex("zmpa", ignore_case = TRUE)) ~ "ZmpA",
+      str_detect(protein, regex("zmpb", ignore_case = TRUE)) ~ "ZmpB",
+      TRUE ~ protein
+    )
+  )
+
+combined_df <- bind_rows(neighbor_df, intra_inter_df) %>%
+  mutate(
+    clade = toTitleCase(clade),
+    clade = factor(clade, levels = c("Blue", "Green", "Pink", "Red", "Yellow")),
+    type  = factor(type,  levels = c("Neighbor", "Intra", "Inter"))
+  )
+
+all_combinations <- expand.grid(
+  clade   = levels(combined_df$clade),
+  type    = levels(combined_df$type),
+  protein = unique(combined_df$protein)
+)
+
+combined_df_complete <- full_join(all_combinations, combined_df,
+                                  by = c("clade", "type", "protein")) %>%
+  replace_na(list(mean_rmsd = NA_real_, sd_rmsd = 0))
+
+#Plot
+comparison_colors <- c(
+  "Neighbor" = "navy",
+  "Intra"    = "royalblue",
+  "Inter"    = "skyblue3"
+)
+
+make_rmsd_plot <- function(df, prot, show_legend = FALSE) {
+  df_sub <- df %>% filter(protein == prot)
+
+  ggplot(df_sub, aes(x = type, y = mean_rmsd, fill = type)) +
+    geom_bar(stat = "identity", position = "dodge", width = 0.6, na.rm = TRUE) +
+    geom_errorbar(aes(ymin = mean_rmsd - sd_rmsd, ymax = mean_rmsd + sd_rmsd),
+                  width = 0.2, linewidth = 0.4,
+                  position = position_dodge(0.6), na.rm = TRUE) +
+    facet_wrap(~ clade, nrow = 2) +
+    scale_fill_manual(
+      values = comparison_colors,
+      labels = c("Neighbor" = "Neighbour", "Intra" = "Intra", "Inter" = "Inter")
+    ) +
+    coord_cartesian(ylim = c(0, 9)) +
+    labs(
+      title = prot,
+      x     = "Comparison Type",
+      y     = "Average RMSD (Å)",
+      fill  = "Type"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title        = element_text(hjust = 0.5, size = 16, face = "bold"),
+      strip.text        = element_text(face = "bold", size = 12),
+      axis.title        = element_text(face = "bold"),
+      axis.text.x       = element_blank(),
+      axis.title.x      = element_blank(),
+      axis.ticks.x      = element_blank(),
+      axis.text.y       = element_text(size = 10),
+      legend.title      = element_text(face = "bold"),
+      legend.text       = element_text(size = 10),
+      panel.grid.major.x= element_blank(),
+      legend.position   = if (show_legend) "right" else "none"
+    )
+}
+
+p_legend_src <- make_rmsd_plot(combined_df_complete, "PspA", show_legend = TRUE)
+shared_legend <- cowplot::get_legend(p_legend_src)
+p_pspA <- p_legend_src + theme(legend.position = "none")
+p_pspC <- make_rmsd_plot(combined_df_complete, "PspC", show_legend = FALSE)
+p_zmpA <- make_rmsd_plot(combined_df_complete, "ZmpA", show_legend = FALSE)
+p_zmpB <- make_rmsd_plot(combined_df_complete, "ZmpB", show_legend = FALSE)
+
+grid_2x2 <- cowplot::plot_grid(
+  p_pspA, p_pspC, p_zmpA, p_zmpB,
+  ncol = 2, labels = c("A", "B", "C", "D"), label_size = 14
+)
+
+with_legend_right <- cowplot::plot_grid(
+  grid_2x2, shared_legend,
+  ncol = 2, rel_widths = c(1, 0.12), align = "h"
+)
+
+final_plot <- cowplot::ggdraw() +
+  draw_label("Rep–Level RMSD Comparisons Across Proteins",
+             fontface = "bold", x = 0.5, y = 0.99, hjust = 0.5, size = 18) +
+  draw_plot(with_legend_right, 0, 0, 1, 0.95)
+
+# Save & show
+ggsave("combined_RMSD.png",
+       plot = final_plot, width = 14, height = 12, dpi = 300, bg = "white")
+
+```
