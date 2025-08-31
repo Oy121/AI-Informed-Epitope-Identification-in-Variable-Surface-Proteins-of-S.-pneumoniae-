@@ -1,0 +1,112 @@
+---
+title: "Coverage graph creation using BLAST data"
+output: html_notebook
+---
+
+BLAST plot creation and coresponding csv file
+
+```{r}
+  library(readr)
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(ggplot2)
+
+#File locations
+files <- c(   "/Users/omeryurttutmus/Desktop/taxa/SP_all/db/PspA_thresholds/95-70/pspa_full_length_id95-70.tsv",   "/Users/omeryurttutmus/Desktop/taxa/SP_all/db/pspC_threshold/95_coverage/pspc_length_id70.tsv",   "/Users/omeryurttutmus/Desktop/taxa/SP_all/db/zmpA_threshold/95-coverage/zmpa_length_id70.tsv",   "/Users/omeryurttutmus/Desktop/taxa/SP_all/db/zmpB_threshold/95-coverage/zmpB_full_length_id95-70.tsv" )
+
+identity_cutoffs <- c(95, 90, 85, 80, 75)
+coverage_cutoff  <- 95
+out_dir <- "~/blast_plots"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+#Coverage and ID
+ID_COL     <- 3        
+COV_COLS   <- c(7, 8)
+
+read_blast <- function(path) {
+  df <- readr::read_tsv(path, col_names = FALSE, show_col_types = FALSE)
+  names(df) <- paste0("V", seq_len(ncol(df)))
+
+  stopifnot(ID_COL <= ncol(df))
+  pident <- suppressWarnings(as.numeric(df[[paste0("V", ID_COL)]]))
+
+  have_cov <- all(COV_COLS <= ncol(df))
+  if (have_cov) {
+    cov1 <- suppressWarnings(as.numeric(df[[paste0("V", COV_COLS[1])]]))
+    cov2 <- suppressWarnings(as.numeric(df[[paste0("V", COV_COLS[2])]]))
+    qcov <- pmin(cov1, cov2, na.rm = TRUE)
+  } else {
+    qcov <- NA_real_
+  }
+
+  tibble(
+    file = basename(path),
+    pident = pident,
+    qcov   = qcov
+  )
+}
+
+blast <- purrr::map_dfr(files, read_blast)
+
+
+has_cov <- !all(is.na(blast$qcov))
+blast_f <- if (has_cov) filter(blast, qcov >= coverage_cutoff) else blast
+
+summary_by_file <- tidyr::crossing(
+  file = unique(blast_f$file),
+  identity_cutoff = sort(identity_cutoffs)
+) %>%
+  left_join(blast_f %>% select(file, pident), by = "file") %>%
+  group_by(file, identity_cutoff) %>%
+  summarise(n_matches = sum(pident >= identity_cutoff, na.rm = TRUE), .groups = "drop") %>%
+  arrange(file, identity_cutoff)
+
+#Edit the protein names so they are not lowercase
+protein_from_filename <- function(x) {
+  nm <- tolower(basename(x))
+  dplyr::case_when(
+    stringr::str_detect(nm, "pspa") ~ "PspA",
+    stringr::str_detect(nm, "pspc") ~ "PspC",
+    stringr::str_detect(nm, "zmpa") ~ "ZmpA",
+    stringr::str_detect(nm, "zmpb") ~ "ZmpB",
+    TRUE ~ "Unknown"
+  )
+}
+
+summary_by_protein <- summary_by_file %>%
+  dplyr::mutate(protein = protein_from_filename(file)) %>%
+  dplyr::filter(protein != "Unknown") %>%
+  dplyr::group_by(protein, identity_cutoff) %>%
+  dplyr::summarise(n_matches = sum(n_matches), .groups = "drop") %>%
+  dplyr::arrange(protein, identity_cutoff)
+
+#Plot
+p_prot <- ggplot2::ggplot(summary_by_protein,
+                          ggplot2::aes(x = identity_cutoff,
+                                       y = n_matches,
+                                       color = protein,
+                                       group = protein)) +
+  ggplot2::geom_line(linewidth = 1) +
+  ggplot2::geom_point(size = 2.2) +
+  ggplot2::scale_x_continuous(breaks = sort(identity_cutoffs)) +
+  ggplot2::labs(
+    title = paste0("BLAST Matches vs Identity Cutoff by Protein",
+                   if (has_cov) paste0(" (Coverage ≥ ", coverage_cutoff, "%)") else ""),
+    x = "Identity Cutoff (%)",
+    y = "Number of Matches",
+    color = "Protein"
+  ) +
+  ggplot2::theme_minimal(base_size = 12) +
+  ggplot2::theme(plot.background = element_rect(fill = "white", colour = NA))
+
+ggplot2::ggsave(file.path(out_dir, "matches_vs_identity_by_protein.png"),
+                p_prot, width = 9, height = 5.5, dpi = 300, bg = "white")
+
+
+write_csv(summary_by_file, file.path(out_dir, "blast_match_summary_by_file.csv"))
+
+ggsave(file.path(out_dir, "newmatches_vs_identity_by_file.png"),
+       p, width = 9, height = 5.5, dpi = 300, bg = "white")
+
+```

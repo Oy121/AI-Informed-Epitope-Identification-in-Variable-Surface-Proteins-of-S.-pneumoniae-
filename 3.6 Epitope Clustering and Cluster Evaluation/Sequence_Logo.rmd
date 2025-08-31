@@ -1,0 +1,359 @@
+---
+title: "Sequence Logo Creation"
+output: html_notebook
+---
+Sequence Logo generating for PspA,PspC and ZmpB (Manually changed from the first section)
+```{r}
+library(tidyverse)
+library(ggseqlogo)
+library(msa)
+library(Biostrings)
+library(patchwork)
+
+#Setup and required parameters
+csv_path       <- "/Users/omeryurttutmus/Downloads/epitope_outputs_hclust_NEW/PspC_epitopes_hclust_ward.D2_autoK5.csv"
+out_dir        <- "PspC_seqlogos_50cov_totaln"
+protein_lab    <- "PspC"
+cap_unique     <- 2000
+min_coverage   <- 0.50  #Determines the minimum coverage needed for the column to stay
+show_legend    <- FALSE    
+
+
+min_len_pre    <- 10
+max_len_pre    <- Inf
+
+dir.create(out_dir, showWarnings = FALSE)
+df <- readr::read_csv(csv_path, show_col_types = FALSE)
+stopifnot(all(c("sequence","cluster","count") %in% names(df)))
+
+clean_aa <- function(x) {
+  x <- toupper(x)
+  gsub("[^ACDEFGHIKLMNPQRSTVWY]", "", x)
+}
+
+df <- df %>%
+  mutate(sequence = clean_aa(sequence),
+         len = nchar(sequence)) %>%
+  filter(len >= min_len_pre, len <= max_len_pre)
+
+##MUSCLE with backup aligner
+align_with_msa_safe <- function(seqs_char) {
+  xset <- AAStringSet(seqs_char)
+  if (length(xset) <= 1L) return(as.character(xset))
+  tryCatch({
+    aln <- msa::msaMuscle(xset)
+    as.character(as(aln, "AAStringSet"))
+  }, error = function(e1) {
+    message("MUSCLE failed: ", conditionMessage(e1), " — trying ClustalW")
+    aln <- msa::msaClustalW(xset)
+    as.character(as(aln, "AAStringSet"))
+  })
+}
+
+write_cluster_fasta <- function(seqs, weights, path) {
+  xset <- AAStringSet(seqs)
+  names(xset) <- sprintf("seq%03d|w=%s", seq_along(seqs), weights)
+  Biostrings::writeXStringSet(xset, filepath = path, format = "fasta")
+}
+
+#Amino acids
+AA20 <- c("A","C","D","E","F","G","H","I","K","L",
+          "M","N","P","Q","R","S","T","V","W","Y")
+
+pwm_from_alignment <- function(aligned_vec, weights, aa_levels = AA20,
+                               min_coverage = 0.0) {
+  stopifnot(length(aligned_vec) == length(weights))
+  aln_mat <- do.call(rbind, strsplit(aligned_vec, ""))
+
+#Weighted coverage
+  aln_bin <- (aln_mat != "-") * 1
+  w_norm  <- weights / sum(weights)
+  coverage <- as.numeric(t(aln_bin) %*% w_norm)
+
+  keep_cols <- which(coverage >= min_coverage)
+  if (length(keep_cols) == 0) keep_cols <- seq_len(ncol(aln_mat))
+  aln_mat <- aln_mat[, keep_cols, drop = FALSE]
+  coverage <- coverage[keep_cols]
+
+#Weight the counts
+  pwm <- matrix(0, nrow = length(aa_levels), ncol = ncol(aln_mat),
+                dimnames = list(aa_levels, NULL))
+  for (j in seq_len(ncol(aln_mat))) {
+    col <- aln_mat[, j]
+    mask <- (col != "-")
+    if (!any(mask)) next
+    res  <- col[mask]
+    wj   <- weights[mask]
+    idx  <- match(res, aa_levels)
+    sums <- rowsum(wj, idx, reorder = FALSE)
+    pwm[as.integer(rownames(sums)), j] <- as.numeric(sums)
+  }
+  col_sums <- pmax(colSums(pwm), 1e-12)
+  pwm_prob <- sweep(pwm, 2, col_sums, "/")
+
+  list(pwm = pwm_prob, coverage = coverage)
+}
+
+#Create logo
+make_logo_from_pwm <- function(pwm_prob, title_txt, show_legend = FALSE) {
+  p <- ggseqlogo(pwm_prob, seq_type = "aa", method = "prob") +
+    ggtitle(title_txt) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title   = element_text(hjust = 0.5, face = "bold"),
+      axis.title.x = element_blank(),
+      axis.title.y = element_blank(),
+      legend.position = if (show_legend) "right" else "none"
+    )
+  p
+}
+
+plots <- list()
+
+for (cl in sort(unique(df$cluster))) {
+  message("Processing cluster: ", cl)
+  dcl <- df %>% filter(cluster == cl)
+  dcl_uni <- dcl %>%
+    count(sequence, wt = count, name = "w") %>%
+    arrange(desc(w))
+  if (nrow(dcl_uni) > cap_unique) dcl_uni <- dcl_uni %>% slice_head(n = cap_unique)
+
+  seqs <- dcl_uni$sequence
+  w <- dcl_uni$w
+  fasta_path <- file.path(out_dir, sprintf("%s_cluster_%02d_raw.fasta", tolower(protein_lab), cl))
+  write_cluster_fasta(seqs, w, fasta_path)
+
+  aligned <- tryCatch(align_with_msa_safe(seqs), error = function(e) NULL)
+  if (is.null(aligned)) next
+
+  pwm_obj  <- pwm_from_alignment(aligned, w, aa_levels = AA20,
+                                 min_coverage = min_coverage)
+  pwm_prob <- pwm_obj$pwm
+  
+  n_unique <- length(seqs)
+  n_total  <- sum(dcl$count, na.rm = TRUE)
+  title_txt <- sprintf("%s Cluster %s (n=%d unique; total=%d)", protein_lab, cl, n_unique, n_total)
+  p <- make_logo_from_pwm(pwm_prob, title_txt, show_legend = show_legend)
+  plots[[as.character(cl)]] <- p
+
+  ggsave(
+    filename = file.path(out_dir, sprintf("%s_cluster_%02d_logo.png", tolower(protein_lab), cl)),
+    plot = p, width = 8, height = 3.2, dpi = 300, bg = "white"
+  )
+}
+
+#Combine
+if (length(plots) > 0) {
+  ncol <- min(2, length(plots))
+
+  combined <- wrap_plots(plots, ncol = ncol) +
+    plot_annotation(
+      title = sprintf("%s Epitope Cluster Sequence Logos", protein_lab),
+      theme = theme(
+        plot.title = element_text(
+          hjust = 0.5,
+          face = "bold",
+          size = 16
+        )
+      )
+    )
+
+  ggsave(
+    filename = file.path(out_dir, sprintf("%s_all_clusters_logos.png", tolower(protein_lab))),
+    plot = combined,
+    width = 10,
+    height = 3.5 * ceiling(length(plots) / ncol),
+    dpi = 300,
+    bg = "white"
+  )
+}
+```
+ZmpA Top 4 clusters
+```{r}
+library(tidyverse)
+library(ggseqlogo)
+library(msa)
+library(Biostrings)
+library(patchwork)
+
+-
+csv_path       <- "/Users/omeryurttutmus/Downloads/epitope_outputs_hclust_autoK_combined_palette/ZmpA_epitopes_hclust_ward.D2_autoK23.csv"
+out_dir        <- "ZmpA_seqlogos_top4_noIC_cov50_New_colour"
+protein_lab    <- "ZmpA"
+cap_unique     <- 2000
+min_coverage   <- 0.50 #Coverage same
+show_legend    <- FALSE
+top_k          <- 4 #Top 4 custers
+
+
+min_len_pre    <- 10
+max_len_pre    <- Inf
+
+dir.create(out_dir, showWarnings = FALSE)
+df <- readr::read_csv(csv_path, show_col_types = FALSE)
+stopifnot(all(c("sequence","cluster","count") %in% names(df)))
+
+clean_aa <- function(x) {
+  x <- toupper(x)
+  gsub("[^ACDEFGHIKLMNPQRSTVWY]", "", x)
+}
+
+df <- df %>%
+  mutate(sequence = clean_aa(sequence),
+         len = nchar(sequence)) %>%
+  filter(len >= min_len_pre, len <= max_len_pre)
+
+#Top 4 clusters
+cluster_stats <- df %>%
+  group_by(cluster) %>%
+  summarise(
+    total_count = sum(count, na.rm = TRUE),
+    n_unique    = n_distinct(sequence),
+    n_rows      = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(total_count))
+
+clusters_to_plot <- head(cluster_stats$cluster, top_k)
+message("Top clusters by total count: ",
+        paste0(clusters_to_plot, collapse = ", "))
+
+df <- df %>% filter(cluster %in% clusters_to_plot)
+cluster_order <- clusters_to_plot
+
+#Aligner same as before
+align_with_msa_safe <- function(seqs_char) {
+  xset <- AAStringSet(seqs_char)
+  if (length(xset) <= 1L) return(as.character(xset))
+  tryCatch({
+    aln <- msa::msaMuscle(xset)
+    as.character(as(aln, "AAStringSet"))
+  }, error = function(e1) {
+    message("MUSCLE failed: ", conditionMessage(e1), " — trying ClustalW")
+    aln <- msa::msaClustalW(xset)
+    as.character(as(aln, "AAStringSet"))
+  })
+}
+
+write_cluster_fasta <- function(seqs, weights, path) {
+  xset <- AAStringSet(seqs)
+  names(xset) <- sprintf("seq%03d|w=%s", seq_along(seqs), weights)
+  Biostrings::writeXStringSet(xset, filepath = path, format = "fasta")
+}
+
+#Amino acids
+AA20 <- c("A","C","D","E","F","G","H","I","K","L",
+          "M","N","P","Q","R","S","T","V","W","Y")
+
+#Weight by coverage
+pwm_from_alignment <- function(aligned_vec, weights, aa_levels = AA20,
+                               min_coverage = 0.0) {
+  stopifnot(length(aligned_vec) == length(weights))
+  aln_mat <- do.call(rbind, strsplit(aligned_vec, ""))
+
+#Weight by count
+  aln_bin <- (aln_mat != "-") * 1
+  w_norm  <- weights / sum(weights)
+  coverage <- as.numeric(t(aln_bin) %*% w_norm)  # length = ncol(aln_mat)
+  keep_cols <- which(coverage >= min_coverage)
+  if (length(keep_cols) == 0) keep_cols <- seq_len(ncol(aln_mat))  # guardrail
+  aln_mat <- aln_mat[, keep_cols, drop = FALSE]
+  coverage <- coverage[keep_cols]
+
+  pwm <- matrix(0, nrow = length(aa_levels), ncol = ncol(aln_mat),
+                dimnames = list(aa_levels, NULL))
+  for (j in seq_len(ncol(aln_mat))) {
+    col <- aln_mat[, j]
+    mask <- (col != "-")
+    if (!any(mask)) next
+    res  <- col[mask]
+    wj   <- weights[mask]
+    idx  <- match(res, aa_levels)
+    sums <- rowsum(wj, idx, reorder = FALSE)
+    pwm[as.integer(rownames(sums)), j] <- as.numeric(sums)
+  }
+  col_sums <- pmax(colSums(pwm), 1e-12)
+  pwm_prob <- sweep(pwm, 2, col_sums, "/")
+
+  list(pwm = pwm_prob, coverage = coverage)
+}
+
+#Create logo
+make_logo_from_pwm <- function(pwm_prob, title_txt, show_legend = FALSE) {
+  ggseqlogo(pwm_prob, seq_type = "aa", method = "prob") +
+    ggtitle(title_txt) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title   = element_text(hjust = 0.5, face = "bold"),
+      axis.title.x = element_blank(),
+      axis.title.y = element_blank(),
+      legend.position = if (show_legend) "right" else "none"
+    )
+}
+
+#Top cluster plots
+plots <- list()
+
+for (cl in cluster_order) {
+  message("Processing cluster: ", cl)
+  dcl <- df %>% filter(cluster == cl)
+  dcl_uni <- dcl %>%
+    count(sequence, wt = count, name = "w") %>%
+    arrange(desc(w))
+
+  if (nrow(dcl_uni) > cap_unique) dcl_uni <- dcl_uni %>% slice_head(n = cap_unique)
+
+  seqs <- dcl_uni$sequence
+  w <- dcl_uni$w
+  fasta_path <- file.path(out_dir, sprintf("%s_cluster_%02d_raw.fasta",
+                                           tolower(protein_lab), as.integer(cl)))
+  write_cluster_fasta(seqs, w, fasta_path)
+
+  aligned <- tryCatch(align_with_msa_safe(seqs), error = function(e) NULL)
+  if (is.null(aligned)) next
+
+  pwm_obj  <- pwm_from_alignment(aligned, w, aa_levels = AA20,
+                                 min_coverage = min_coverage)
+  pwm_prob <- pwm_obj$pwm
+
+  n_unique <- length(seqs)
+  n_total  <- sum(dcl$count, na.rm = TRUE)
+  title_txt <- sprintf("%s Cluster %s (n=%d unique; total=%d)", protein_lab, cl, n_unique, n_total)
+
+  p <- make_logo_from_pwm(pwm_prob, title_txt, show_legend = show_legend)
+  plots[[as.character(cl)]] <- p
+
+  ggsave(
+    filename = file.path(out_dir, sprintf("%s_cluster_%02d_logo.png",
+                                          tolower(protein_lab), as.integer(cl))),
+    plot = p, width = 8, height = 3.2, dpi = 300, bg = "white"
+  )
+}
+
+#Combine
+if (length(plots) > 0) {
+  ncol <- min(2, length(plots))
+
+  combined <- wrap_plots(plots, ncol = ncol) +
+    plot_annotation(
+      title = sprintf("%s Epitope Cluster Sequence Logos (Top 4)", protein_lab),
+      theme = theme(
+        plot.title = element_text(
+          hjust = 0.5,
+          face = "bold",
+          size = 16
+        )
+      )
+    )
+
+  ggsave(
+    filename = file.path(out_dir, sprintf("%s_all_clusters_logos.png", tolower(protein_lab))),
+    plot = combined,
+    width = 10,
+    height = 3.5 * ceiling(length(plots) / ncol),
+    dpi = 300,
+    bg = "white"
+  )
+}
+readr::write_csv(cluster_stats, file.path(out_dir, "cluster_totals_summary.csv"))
+```

@@ -1,0 +1,322 @@
+---
+title: "Creating t-SNE plots."
+explanation: "Running Hierarchical Clustering (Ward.D2) for each protein with best K values for all determined by parameters to generate t-SNE plots"
+output: html_notebook
+---
+Setup for the Hclust
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(magrittr)
+library(tidyverse)
+library(Rtsne)
+library(slider)
+library(factoextra)
+library(stringdist)
+library(cluster)
+library(fpc)
+library(patchwork)
+
+suppressWarnings({
+  if (!"conflicted" %in% .packages(all.available = TRUE)) {
+    try(suppressMessages(install.packages("conflicted")), silent = TRUE)
+  }
+})
+suppressMessages(require(conflicted, quietly = TRUE, warn.conflicts = FALSE))
+if ("conflicted" %in% loadedNamespaces()) {
+  conflict_prefer("filter", "dplyr")
+  conflict_prefer("select", "dplyr")
+  conflict_prefer("slice",  "dplyr")
+  conflict_prefer("lag",    "dplyr")
+  conflict_prefer("mutate", "dplyr")
+  conflict_prefer("arrange","dplyr")
+}
+
+
+set.seed(42)
+
+get_palette <- function(n) {
+  n <- max(1, as.integer(n))
+  if (n <= 20) {
+    grDevices::hcl.colors(n, palette = "Dynamic")
+  } else if (n <= 80) {
+    grDevices::hcl.colors(n, palette = "Set 3", fixup = TRUE)
+  } else {
+    grDevices::hsv(h = seq(0, 1, length.out = n + 1)[-1], s = 0.85, v = 0.95)
+  }
+}
+
+
+#Epitope sequence identification functions
+get_epitope_sequences <- function(fn, length_threshold = 10) {
+  readr::read_csv(file = fn, show_col_types = FALSE) %>%
+    dplyr::select(pdb, chain, epitope, residue) %>%
+    dplyr::mutate(
+      residue = as.character(residue),
+      epitope = as.logical(epitope),
+      epitope_sum = slider::slide_dbl(
+        epitope, sum,
+        .before = floor(length_threshold/2),
+        .after  = floor(length_threshold/2),
+        .complete = FALSE
+      ),
+      epitope_av   = epitope_sum / length_threshold,
+      epitope      = dplyr::if_else(epitope_av > 0.75, TRUE, epitope),
+      epitope_index = cumsum(na.omit(c(0, (epitope * !dplyr::lag(epitope, n = 1L)))))
+    ) %>%
+    dplyr::filter(epitope) %>%
+    dplyr::group_by(epitope_index) %>% dplyr::mutate(Length = dplyr::n()) %>% dplyr::ungroup() %>%
+    dplyr::filter(Length > length_threshold) %>%
+    tidyr::nest(data = residue, .by = c(pdb, chain, epitope_index)) %>%
+    dplyr::group_by(epitope_index) %>%
+    dplyr::mutate(sequence = paste0(unlist(data), collapse = "")) %>%
+    dplyr::select(-c(data, chain)) %>%
+    dplyr::ungroup() %>%
+    dplyr::select(-epitope_index) %>%
+    dplyr::mutate(sequence = as.character(sequence)) %>%
+    dplyr::group_by(sequence) %>%
+    dplyr::mutate(count = dplyr::n_distinct(pdb)) %>%
+    tidyr::nest(seq_ids = pdb) %>%  # retain provenance
+    dplyr::ungroup() %>%
+    dplyr::distinct() %>%
+    tibble::rowid_to_column("epitope_index")
+}
+
+#Distance matrix
+compare_epitopes <- function(epitope_df) {
+  epitope_df %>%
+    dplyr::mutate(sequence = as.character(sequence)) %>%
+    dplyr::mutate(X = "X") %>%
+    dplyr::full_join(
+      epitope_df %>% dplyr::rename(query = sequence, query_epitope_index = epitope_index) %>%
+        dplyr::select(query_epitope_index, query) %>% dplyr::mutate(X = "X"),
+      by = "X", relationship = "many-to-many"
+    ) %>%
+    dplyr::select(-X) %>%
+    dplyr::mutate(similarity = stringdist::stringsim(sequence, query)) %>%
+    dplyr::mutate(
+      epitope_index       = paste0("epitope_", as.character(epitope_index)),
+      query_epitope_index = paste0("epitope_", as.character(query_epitope_index))
+    )
+}
+
+generate_epitope_similarity_matrix <- function(epitope_comparison_df) {
+  epitope_comparison_df %>%
+    dplyr::select(epitope_index, query_epitope_index, similarity) %>%
+    tidyr::pivot_wider(id_cols = epitope_index,
+                       names_from = query_epitope_index,
+                       values_from = similarity) %>%
+    tibble::column_to_rownames("epitope_index") %>%
+    as.matrix()
+}
+
+sanitize_similarity <- function(S) {
+  S[is.na(S)] <- 0
+  S <- pmax(S, t(S))
+  S[S < 0] <- 0; S[S > 1] <- 1
+  diag(S) <- 1
+  S
+}
+
+eval_hclust_k <- function(S, k, method = "ward.D2") {
+  S <- sanitize_similarity(S)
+  D <- 1 - S; diag(D) <- 0
+  dist_obj <- stats::as.dist(D)
+
+  hc <- stats::hclust(dist_obj, method = method)
+  labs <- stats::cutree(hc, k = k)
+  names(labs) <- rownames(S)
+
+  cs <- fpc::cluster.stats(d = dist_obj, clustering = as.integer(as.factor(labs)))
+  list(k = k, labs = labs, sil = cs$avg.silwidth, ch = cs$ch, dunn = cs$dunn)
+}
+
+#Picking the best K for each protein
+choose_best_k_hclust <- function(S, k_min = 2, k_max = 50, method = "ward.D2") {
+  N <- nrow(S)
+  k_max <- min(k_max, max(k_min, floor(N/6)))  # sensible bound
+
+  res <- purrr::map_df(k_min:k_max, function(k) {
+    ek <- eval_hclust_k(S, k, method = method)
+    tibble::tibble(k = ek$k, sil = ek$sil, ch = ek$ch, dunn = ek$dunn)
+  })
+
+  res <- res %>%
+    dplyr::mutate(
+      r_sil  = rank(-sil,  ties.method = "min"),
+      r_ch   = rank(-ch,   ties.method = "min"),
+      r_dunn = rank(-dunn, ties.method = "min")
+    ) %>%
+    dplyr::mutate(
+      p_sil  = 1 - (r_sil  - 1) / (max(r_sil)  - 1),
+      p_ch   = 1 - (r_ch   - 1) / (max(r_ch)   - 1),
+      p_dunn = 1 - (r_dunn - 1) / (max(r_dunn) - 1)
+    ) %>%
+    dplyr::mutate(avg_percentile = rowMeans(cbind(p_sil, p_ch, p_dunn), na.rm = TRUE))
+
+  best_row <- res %>% dplyr::arrange(dplyr::desc(avg_percentile), k) %>% dplyr::slice(1)
+  list(k_best = best_row$k, sweep = res)
+}
+
+build_idx_tbl <- function(S, labs, epitope_df, proline_frac = 0.40) {
+  lab_df <- tibble::tibble(epitope_index_chr = names(labs),
+                           cluster = as.character(labs))
+  meta <- epitope_df %>%
+    dplyr::mutate(epitope_index_chr = paste0("epitope_", epitope_index),
+                  proline_fraction  = stringr::str_count(stringr::str_to_upper(sequence), "P")/nchar(sequence),
+                  is_proline_rich   = proline_fraction >= proline_frac) %>%
+    dplyr::distinct(epitope_index_chr, count, is_proline_rich)
+
+  tibble::tibble(epitope_index_chr = rownames(S)) %>%
+    dplyr::left_join(lab_df, by = "epitope_index_chr") %>%
+    dplyr::left_join(meta,   by = "epitope_index_chr")
+}
+
+plot_epitope_tsne <- function(S, idx_tbl, protein,
+                              proline_frac = 0.40, length_threshold = 10) {
+  N <- nrow(S); safe_perp <- min(50, floor((N - 1) / 3))
+  ts_obj <- Rtsne::Rtsne(S, perplexity = max(5, safe_perp))
+
+  proj_df <- dplyr::bind_cols(
+    tibble::as_tibble(ts_obj$Y) %>% dplyr::rename(x = V1, y = V2),
+    idx_tbl %>% dplyr::select(cluster, count, is_proline_rich)
+  ) %>% dplyr::mutate(cluster = factor(cluster))
+
+  n_clu <- nlevels(proj_df$cluster)
+  pal   <- get_palette(n_clu)
+  show_prr <- protein %in% c("PspA", "PspC")
+
+  p <- ggplot2::ggplot(proj_df, ggplot2::aes(x = x, y = y)) +
+    ggplot2::geom_point(ggplot2::aes(size = count, fill = cluster),
+                        shape = 21, alpha = 0.85, colour = "grey20", stroke = 0.2) +
+    ggplot2::scale_fill_manual(values = pal, na.value = "grey80", drop = FALSE) +
+    ggplot2::guides(
+      size = ggplot2::guide_legend(
+        title = "Count",
+        override.aes = list(fill = "grey70", colour = NA, alpha = 1, shape = 21)
+      ),
+      fill = ggplot2::guide_legend(title = "Cluster")
+    ) +
+    ggplot2::labs(
+      title = paste0(protein, " t-SNE (Length threshold = ", length_threshold, ")"),
+      subtitle = paste0("Perplexity = ", max(5, safe_perp)),
+      x = NULL, y = NULL
+    ) +
+    ggplot2::theme_bw()
+
+  if (show_prr) {
+    p <- p + ggplot2::geom_point(data = subset(proj_df, is_proline_rich),
+                                 ggplot2::aes(x = x, y = y, size = count),
+                                 shape = 21, fill = NA, colour = "red", stroke = 0.6)
+  }
+  p
+}
+```
+Run the code with desired length proline threshold etc.
+```{r}
+
+
+length_threshold <- 10
+proline_frac     <- 0.40
+out_dir          <- "epitope_outputs_hclust"
+dir.create(out_dir, showWarnings = FALSE)
+
+patterns <- list(
+  PspA = "/Users/omeryurttutmus/Desktop/taxa/Filtered_Discotope_LPXTG/pspA_filtered_epitopes_justInterpro.csv",
+  PspC = "/Users/omeryurttutmus/Desktop/taxa/Filtered_Discotope_LPXTG/pspC_filtered_epitopes_justInterpro.csv",
+  ZmpA = "/Users/omeryurttutmus/Desktop/taxa/Filtered_Discotope_LPXTG/zmpA_filtered_epitopes_justInterpro.csv",
+  ZmpB = "/Users/omeryurttutmus/Desktop/taxa/Filtered_Discotope_LPXTG/zmpB_filtered_epitopes_justInterpro.csv"
+)
+
+hclust_method <- "ward.D2"
+k_range <- c(4, 50)
+
+summary_rows <- list()
+plots <- list() 
+
+for (prot in names(patterns)) {
+  message(">>> Processing (hclust auto-K) ", prot)
+  files <- Sys.glob(patterns[[prot]])
+  if (length(files) == 0) { warning("No files matched: ", patterns[[prot]]); next }
+
+  epitope_df <- dplyr::bind_rows(lapply(files, get_epitope_sequences, length_threshold = length_threshold))
+  if (nrow(epitope_df) == 0) { warning("No epitopes passed filters for ", prot); next }
+
+  epitope_comparison_df <- compare_epitopes(epitope_df)
+  S <- generate_epitope_similarity_matrix(epitope_comparison_df)
+  S <- sanitize_similarity(S)
+
+  kb <- choose_best_k_hclust(S, k_min = k_range[1], k_max = k_range[2], method = hclust_method)
+  k_best <- kb$k_best
+
+  fit <- eval_hclust_k(S, k = k_best, method = hclust_method)
+  if (length(unique(fit$labs)) == 1) {
+    cand <- kb$sweep %>% dplyr::arrange(dplyr::desc(avg_percentile), k)
+    for (kk in cand$k) {
+      try_fit <- eval_hclust_k(S, k = kk, method = hclust_method)
+      if (length(unique(try_fit$labs)) > 1) { k_best <- kk; fit <- try_fit; break }
+    }
+    message(sprintf("Degenerate cut; using k=%d for %s.", k_best, prot))
+  }
+  tab <- table(fit$labs)
+  message(sprintf("%s cluster sizes (k=%d): %s", prot, k_best,
+                  paste(names(tab), as.integer(tab), sep=":", collapse=", ")))
+
+  kb$sweep %>%
+    readr::write_csv(file.path(out_dir, paste0(prot, "_hclust_", hclust_method, "_Ksweep.csv")))
+  
+  summary_rows[[prot]] <- tibble::tibble(
+    Protein = prot,
+    Consensus_K = k_best,
+    Best_avg_percentile = kb$sweep %>% dplyr::filter(k == k_best) %>% dplyr::pull(avg_percentile),
+    Silhouette = kb$sweep %>% dplyr::filter(k == k_best) %>% dplyr::pull(sil),
+    CH = kb$sweep %>% dplyr::filter(k == k_best) %>% dplyr::pull(ch),
+    Dunn = kb$sweep %>% dplyr::filter(k == k_best) %>% dplyr::pull(dunn)
+  )
+
+#Plot
+  idx_tbl <- build_idx_tbl(S, labs = fit$labs, epitope_df = epitope_df, proline_frac = proline_frac)
+  tsne_plot <- plot_epitope_tsne(S, idx_tbl, protein = prot,
+                                 proline_frac = proline_frac,
+                                 length_threshold = length_threshold)
+  plots[[prot]] <- tsne_plot
+
+  ggplot2::ggsave(
+    file.path(out_dir, paste0(prot, "_tsne_hclust_", hclust_method, "_autoK", k_best, ".png")),
+    plot = tsne_plot, width = 8, height = 6, dpi = 300
+  )
+
+  epitope_df %>%
+    dplyr::mutate(epitope_index_chr = paste0("epitope_", epitope_index)) %>%
+    dplyr::left_join(tibble::tibble(epitope_index_chr = names(fit$labs),
+                                    cluster = as.character(fit$labs)),
+                     by = "epitope_index_chr") %>%
+    dplyr::select(epitope_index, sequence, count, cluster, seq_ids) %>%
+    dplyr::mutate(seq_ids = vapply(seq_ids,
+                                   function(tb) paste(unique(tb$pdb), collapse = ";"),
+                                   FUN.VALUE = character(1))) %>%
+    readr::write_csv(file.path(out_dir, paste0(
+      prot, "_epitopes_hclust_", hclust_method, "_autoK", k_best, ".csv")))
+}
+
+ksweep_summary <- dplyr::bind_rows(summary_rows)
+readr::write_csv(ksweep_summary, file.path(out_dir, "ksweep.csv"))
+ksweep_summary
+
+#Combined plots
+if (all(c("PspA","PspC") %in% names(plots))) {
+  psp_combined <- plots$PspA / plots$PspC + plot_annotation(
+    title = "PspA (top) and PspC (bottom) — Ward.D2 auto-K"
+  )
+  ggsave(file.path(out_dir, "PspA_PspC_combined.png"),
+         plot = psp_combined, width = 8, height = 12, dpi = 300)
+}
+
+if (all(c("ZmpA","ZmpB") %in% names(plots))) {
+  zmp_combined <- plots$ZmpA / plots$ZmpB + plot_annotation(
+    title = "ZmpA (top) and ZmpB (bottom) — Ward.D2 auto-K"
+  )
+  ggsave(file.path(out_dir, "ZmpA_ZmpB_combined.png"),
+         plot = zmp_combined, width = 8, height = 12, dpi = 300)
+}
+```
